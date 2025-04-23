@@ -1,5 +1,7 @@
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Generator, Union, Dict
 import httpx
+import json
+import asyncio
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 
@@ -8,18 +10,28 @@ mcp = FastMCP(name="mcp-integration")
 
 # Constants with increased timeout
 API_TIMEOUT = 60.0  # 60 seconds timeout for all API calls
+API_SLOW_ENDPOINT_TIMEOUT = 120.0  # 2 minutes for slow endpoints
 NWS_API_BASE = "https://api.weather.gov"
 MCP2_BASE_URL = "http://34.31.55.189:8080"
-PLAYWRIGHT_MCP_URL = "https://playwright-mcp-620401541065.us-central1.run.app"
+PLAYWRIGHT_MCP_URL = "https://playwright-mcp-nttc25y22a-uc.a.run.app"
 PROPHET_SERVICE_URL = "http://34.45.252.228:8000"
 CODE_EXECUTOR_URL = "http://34.66.53.176:8002"
 USER_AGENT = "mcp-integration/1.0"
+
+# Custom progress notification handler
+async def send_progress(message: str):
+    """Send progress notification in a way compatible with the current FastMCP version."""
+    # Log progress to stdout for debugging
+    print(f"PROGRESS: {message}")
+    # In newer versions of FastMCP, we would use mcp.progress here
+    # For now, we'll just log the progress
 
 async def make_api_request(
     url: str, 
     method: str = "GET", 
     json_data: Optional[dict] = None,
-    params: Optional[dict] = None
+    params: Optional[dict] = None,
+    progress_callback: Optional[callable] = None
 ) -> Optional[dict]:
     """Make an API request with extended timeout and error handling."""
     headers = {
@@ -27,20 +39,77 @@ async def make_api_request(
         "Accept": "application/json"
     }
     
-    async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+    # Determine if this is a potentially slow endpoint
+    is_slow_endpoint = any(keyword in url for keyword in ["enhance", "playwright", "masa", "search", "execute"])
+    current_timeout = API_SLOW_ENDPOINT_TIMEOUT if is_slow_endpoint else API_TIMEOUT
+    
+    # Send initial progress notification
+    if progress_callback:
+        await progress_callback(f"Starting request to {url}")
+    
+    # Implementation of exponential backoff for retries
+    max_retries = 3 if is_slow_endpoint else 1
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
         try:
-            if method == "GET":
-                response = await client.get(url, headers=headers, params=params)
-            else:
-                response = await client.post(url, headers=headers, json=json_data)
+            if retry_count > 0 and progress_callback:
+                await progress_callback(f"Retry attempt {retry_count}/{max_retries} for {url}")
             
-            response.raise_for_status()
-            return response.json()
+            async with httpx.AsyncClient(timeout=current_timeout) as client:
+                if progress_callback:
+                    await progress_callback(f"Connecting to {url}")
+                    
+                if method == "GET":
+                    response = await client.get(url, headers=headers, params=params)
+                else:
+                    response = await client.post(url, headers=headers, json=json_data)
+                
+                if progress_callback:
+                    await progress_callback(f"Received response from {url} with status {response.status_code}")
+                    
+                response.raise_for_status()
+                return response.json()
+                
+        except httpx.TimeoutException as e:
+            last_error = e
+            print(f"Request to {url} timed out after {current_timeout}s on attempt {retry_count + 1}/{max_retries + 1}")
+            
+            # Increase timeout for next retry
+            current_timeout *= 1.5
+            
+            if retry_count == max_retries:
+                print(f"Maximum retries reached for {url}. Last error: {str(e)}")
+                break
+                
         except httpx.HTTPStatusError as e:
+            last_error = e
             print(f"HTTP error for {url}: {e.response.status_code} - {e.response.text}")
+            
+            # Don't retry for client errors (4xx)
+            if e.response.status_code >= 400 and e.response.status_code < 500:
+                break
+                
         except Exception as e:
+            last_error = e
             print(f"Error making request to {url}: {str(e)}")
-        return None
+            
+            # For other errors, we'll retry as well
+        
+        retry_count += 1
+        
+        if retry_count <= max_retries:
+            # Wait before retrying with exponential backoff
+            backoff_time = 2 ** retry_count
+            if progress_callback:
+                await progress_callback(f"Waiting {backoff_time}s before retry")
+            await asyncio.sleep(backoff_time)
+    
+    if last_error:
+        print(f"Final error for {url}: {str(last_error)}")
+    
+    return None
 
 # Health Check Endpoints
 @mcp.tool()
@@ -124,6 +193,10 @@ async def enhance_tweets_masa(
     custom_instruction: Optional[str] = None
 ) -> str:
     """Enhance Twitter search results using Masa API"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     payload = {
         "query": query,
         "max_results": max_results,
@@ -132,37 +205,48 @@ async def enhance_tweets_masa(
     if custom_instruction:
         payload["custom_instruction"] = custom_instruction
     
+    await report_progress(f"Starting search for '{query}'")
+    
     data = await make_api_request(
         f"{MCP2_BASE_URL}/api/masa/enhance",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data or "results" not in data:
         return "Failed to enhance tweets"
     
+    await report_progress(f"Processing {len(data['results'])} results")
+    
     results = []
     for item in data["results"]:
         tweet = item.get("original_tweet", {})
-        enhanced = item.get("enhanced_content", "No enhanced content")
+        enhanced = item.get("enhanced_version", "No enhanced content")
+        research = item.get("research", {})
+        
         results.append(
-            f"Original: {tweet.get('Content', '')}\n"
+            f"Original Tweet: {tweet.get('Content', '')}\n"
             f"Enhanced: {enhanced}\n"
-            f"Topics: {item.get('topics', [])}\n"
-            f"Sentiment: {item.get('sentiment', 'unknown')}\n"
+            f"Research Query: {research.get('generated_query', '')}\n"
+            f"Source URL: {research.get('source_url', '')}\n"
             "---"
         )
     
+    await report_progress("Completed enhancement")
     return "\n".join(results)
 
 @mcp.tool()
-async def extract_search_terms(query: str, max_results: int = 5, enhance_top_x: int = 3) -> str:
+async def extract_search_terms(query: str, max_results: int = 5, enhance_top_x: int = 3, custom_instruction: Optional[str] = None) -> str:
     """Extract search terms from Twitter content"""
     payload = {
         "query": query,
         "max_results": max_results,
         "enhance_top_x": enhance_top_x
     }
+    if custom_instruction:
+        payload["custom_instruction"] = custom_instruction
+    
     data = await make_api_request(
         f"{MCP2_BASE_URL}/api/masa/searchTerm",
         method="POST",
@@ -172,53 +256,142 @@ async def extract_search_terms(query: str, max_results: int = 5, enhance_top_x: 
     if not data or "results" not in data:
         return "Failed to extract search terms"
     
-    return "\n".join([
-        f"Original: {item.get('original_tweet', {}).get('Content', '')}\n"
-        f"Search Term: {item.get('search_term', '')}\n"
-        "---"
-        for item in data["results"]
-    ])
-
-# Playwright MCP Endpoints
-@mcp.tool()
-async def enhance_tweets_playwright(tweets: List[dict], custom_instruction: Optional[str] = None) -> str:
-    """Enhance tweets using Playwright"""
-    payload = {
-        "tweets": tweets,
-    }
-    if custom_instruction:
-        payload["custom_instruction"] = custom_instruction
-    
-    data = await make_api_request(
-        f"{PLAYWRIGHT_MCP_URL}/enhance-tweets-playwright",
-        method="POST",
-        json_data=payload
-    )
-    
-    if not data or not data.get("success"):
-        return "Failed to enhance tweets with Playwright"
-    
     results = []
-    for item in data.get("results", []):
+    for item in data["results"]:
+        tweet = item.get("original_tweet", {})
+        search_term = item.get("search_term", "")
+        
         results.append(
-            f"Original: {item.get('original_tweet', {}).get('Content', '')}\n"
-            f"Enhanced: {item.get('enhanced_version', '')}\n"
-            f"Research: {item.get('research', {}).get('generated_query', '')}\n"
+            f"Original: {tweet.get('Content', '')}\n"
+            f"Search Term: {search_term}\n"
             "---"
         )
     
     return "\n".join(results)
 
+# Playwright MCP Endpoints
+@mcp.tool()
+async def enhance_tweets_playwright(tweets: List[dict], custom_instruction: Optional[str] = None) -> str:
+    """Enhance tweets using Playwright"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
+    payload = {
+        "tweets": tweets
+    }
+    if custom_instruction:
+        payload["custom_instruction"] = custom_instruction
+    
+    await report_progress(f"Starting enhancement of {len(tweets)} tweets")
+    
+    data = await make_api_request(
+        f"{PLAYWRIGHT_MCP_URL}/enhance-tweets-playwright",
+        method="POST",
+        json_data=payload,
+        progress_callback=report_progress
+    )
+    
+    if not data or not data.get("success"):
+        return "Failed to enhance tweets with Playwright"
+    
+    await report_progress(f"Processing {len(data.get('results', []))} results")
+    
+    results = []
+    for item in data.get("results", []):
+        original = item.get("original_tweet", {})
+        enhanced = item.get("enhanced_version", "")
+        research = item.get("research", {})
+        error = item.get("error", "")
+        
+        if error:
+            results.append(
+                f"Original: {original.get('Content', '')}\n"
+                f"Error: {error}\n"
+                f"Details: {item.get('details', '')}\n"
+                "---"
+            )
+        else:
+            results.append(
+                f"Original: {original.get('Content', '')}\n"
+                f"Enhanced: {enhanced}\n"
+                f"Research Query: {research.get('generated_query', '')}\n"
+                f"Source URL: {research.get('source_url', '')}\n"
+                "---"
+            )
+    
+    performance = data.get("performance", {})
+    await report_progress("Enhancement completed")
+    return f"Success: {data.get('success')}\nCount: {data.get('count')}\nPerformance: {performance.get('avg_time_per_tweet_ms')}ms per tweet\n\n" + "\n".join(results)
+
+@mcp.tool()
+async def enhance_tweets_playright(
+    query: str, 
+    max_results: int = 8, 
+    enhance_top_x: int = 3,
+    custom_instruction: Optional[str] = None
+) -> str:
+    """Enhance Twitter search results using Playright API"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
+    payload = {
+        "query": query,
+        "max_results": max_results,
+        "enhance_top_x": enhance_top_x
+    }
+    if custom_instruction:
+        payload["custom_instruction"] = custom_instruction
+    
+    await report_progress(f"Starting search for '{query}'")
+    
+    data = await make_api_request(
+        f"{MCP2_BASE_URL}/api/playright/enhance",
+        method="POST",
+        json_data=payload,
+        progress_callback=report_progress
+    )
+    
+    if not data or "results" not in data:
+        return "Failed to enhance tweets with Playright"
+    
+    await report_progress(f"Processing {len(data['results'])} results")
+    
+    results = []
+    for item in data["results"]:
+        tweet = item.get("original_tweet", {})
+        enhanced = item.get("enhanced_version", "No enhanced content")
+        research = item.get("research", {})
+        
+        results.append(
+            f"Original Tweet: {tweet.get('Content', '')}\n"
+            f"Enhanced: {enhanced}\n"
+            f"Research Query: {research.get('generated_query', '')}\n"
+            f"Source URL: {research.get('source_url', '')}\n"
+            "---"
+        )
+    
+    await report_progress("Completed enhancement")
+    return "\n".join(results)
+
 @mcp.tool()
 async def automate_web_interaction(url: str, instructions: str) -> str:
     """Automate web interactions using Playwright"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     payload = {
         "url": url,
         "instructions": instructions
     }
     
+    await report_progress(f"Starting web automation for {url}")
+    
     if instructions == "screenshot":
         try:
+            await report_progress("Taking screenshot")
             async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
                 response = await client.post(
                     f"{PLAYWRIGHT_MCP_URL}/automate",
@@ -226,6 +399,7 @@ async def automate_web_interaction(url: str, instructions: str) -> str:
                     headers={"Accept": "image/png"}
                 )
                 response.raise_for_status()
+                await report_progress("Screenshot taken")
                 return "Screenshot received (binary data)"
         except Exception as e:
             return f"Failed to get screenshot: {str(e)}"
@@ -233,12 +407,14 @@ async def automate_web_interaction(url: str, instructions: str) -> str:
         data = await make_api_request(
             f"{PLAYWRIGHT_MCP_URL}/automate",
             method="POST",
-            json_data=payload
+            json_data=payload,
+            progress_callback=report_progress
         )
         
         if not data:
             return "Failed to perform web automation"
         
+        await report_progress("Web automation completed")
         return data.get("text", "No text content received")
 
 # Code Executor Endpoints
@@ -247,7 +423,7 @@ async def execute_python_code(code: str) -> str:
     """Execute Python code in secure environment"""
     payload = {
         "code": code,
-        "timeout": 30,
+        "timeout": 10,
         "memory_limit": "200m",
         "cpu_limit": 0.5,
         "validate_code": True
@@ -263,37 +439,52 @@ async def execute_python_code(code: str) -> str:
         return "Failed to execute code"
     
     return (
-        f"Execution Time: {data.get('execution_time', 0)}s\n"
-        f"Exit Code: {data.get('exit_code', -1)}\n"
-        f"Validation: {data.get('validation_result', '')}\n"
+        f"Code Execution Results:\n"
+        f"-----------------------------------\n"
         f"Output:\n{data.get('stdout', '')}\n"
-        f"Errors:\n{data.get('stderr', '')}"
+        f"Errors:\n{data.get('stderr', '')}\n"
+        f"Exit Code: {data.get('exit_code', -1)}\n"
+        f"Execution Time: {data.get('execution_time', 0)}s\n"
+        f"Validation: {data.get('validation_result', '')}"
     )
 
 @mcp.tool()
 async def generate_and_execute(query: str) -> str:
     """Generate and execute Python code from natural language query"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     payload = {
         "query": query,
-        "timeout": 45,
+        "timeout": 10,
         "memory_limit": "300m",
         "cpu_limit": 0.5
     }
     
+    await report_progress(f"Generating code for: {query}")
+    
     data = await make_api_request(
         f"{CODE_EXECUTOR_URL}/generate-and-execute",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data:
         return "Failed to generate and execute code"
     
+    await report_progress("Code generated and executed")
+    
     return (
         f"Generated Code:\n{data.get('generated_code', '')}\n\n"
-        f"Execution Time: {data.get('execution_time', 0)}s\n"
+        f"Execution Results:\n"
+        f"-----------------------------------\n"
         f"Output:\n{data.get('stdout', '')}\n"
-        f"Errors:\n{data.get('stderr', '')}"
+        f"Errors:\n{data.get('stderr', '')}\n"
+        f"Exit Code: {data.get('exit_code', -1)}\n"
+        f"Execution Time: {data.get('execution_time', 0)}s\n"
+        f"Validation: {data.get('validation_result', '')}"
     )
 
 # Prophet Service Endpoints
@@ -302,17 +493,23 @@ async def store_engagement_data(
     topic: str,
     platform: str,
     value: float,
-    source: str = "api"
+    source: str = "api",
+    additional_metadata: Optional[dict] = None
 ) -> str:
     """Store engagement data for a topic"""
+    
+    metadata = {
+        "source": source
+    }
+    if additional_metadata:
+        metadata.update(additional_metadata)
+    
     payload = {
         "topic": topic,
         "platform": platform,
         "timestamp": datetime.utcnow().isoformat(),
         "value": value,
-        "metadata": {
-            "source": source
-        }
+        "metadata": metadata
     }
     
     data = await make_api_request(
@@ -456,6 +653,52 @@ async def get_weather_alerts(state: str) -> str:
 def echo_resource(message: str) -> str:
     """Echo a message as a resource"""
     return f"Resource echo: {message}"
+
+@mcp.tool()
+async def get_topic_latest(topic: str) -> str:
+    """Get latest information for a topic"""
+    data = await make_api_request(
+        f"{PLAYWRIGHT_MCP_URL}/api/topic/{topic}/latest"
+    )
+    
+    if not data:
+        return f"No latest data found for topic {topic}"
+    
+    # Format the response based on what the API returns
+    if isinstance(data, dict):
+        return f"Latest information for {topic}:\n{json.dumps(data, indent=2)}"
+    else:
+        return f"Latest information for {topic}:\n{data}"
+
+@mcp.tool()
+async def debug_last_request() -> str:
+    """Debug the last API request that failed"""
+    return f"""
+To debug API requests that are timing out (MCP error -32001):
+
+1. Check API endpoint is correct:
+   - enhace-tweets-playwright → {PLAYWRIGHT_MCP_URL}/enhance-tweets-playwright
+   - masa enhance → {MCP2_BASE_URL}/api/masa/enhance
+   - store engagement → {PROPHET_SERVICE_URL}/api/v1/store-engagement
+
+2. Verify request payload format:
+   - For enhance-tweets-playwright: Use "tweets" list with tweet objects
+   - For masa enhance: Use "query", "max_results", "enhance_top_x"
+   - For playright enhance: Use "query", "max_results", "enhance_top_x" 
+
+3. Current timeout setting is {API_TIMEOUT} seconds
+   - These APIs may need more time to process, consider increasing timeout
+
+4. Error handling strategies:
+   - Retry with fewer results (lower max_results)
+   - Check server status with health endpoints
+   - Break requests into smaller batches
+
+5. API Server status:
+   - MCP2 Server: Run check_mcp2_health()
+   - Playwright: Run check_playwright_health()
+   - Prophet Service: Run check_prophet_health()
+"""
 
 if __name__ == "__main__":
     print("Starting MCP Integration Server with stdio transport...")
