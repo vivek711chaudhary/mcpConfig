@@ -11,6 +11,8 @@ mcp = FastMCP(name="mcp-integration")
 # Constants with increased timeout
 API_TIMEOUT = 60.0  # 60 seconds timeout for all API calls
 API_SLOW_ENDPOINT_TIMEOUT = 120.0  # 2 minutes for slow endpoints
+WEATHER_API_KEY = "174c5941cd1842f58d475356242605"
+WEATHER_API_BASE = "http://api.weatherapi.com/v1"
 NWS_API_BASE = "https://api.weather.gov"
 MCP2_BASE_URL = "http://34.31.55.189:8080"
 PLAYWRIGHT_MCP_URL = "https://playwright-mcp-nttc25y22a-uc.a.run.app"
@@ -110,6 +112,27 @@ async def make_api_request(
         print(f"Final error for {url}: {str(last_error)}")
     
     return None
+
+# Weather API specific request function with progress support
+async def weather_api_request(endpoint: str, params: dict) -> Optional[dict]:
+    """Make a direct API request to the WeatherAPI.com with minimal overhead and error handling."""
+    url = f"{WEATHER_API_BASE}/{endpoint}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "application/json"
+    }
+    
+    # Add API key to params
+    params["key"] = WEATHER_API_KEY
+    
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        print(f"Weather API error for {url}: {str(e)}")
+        return None
 
 # Health Check Endpoints
 @mcp.tool()
@@ -354,6 +377,7 @@ async def enhance_tweets_playright(
     )
     
     if not data or "results" not in data:
+        await report_progress("Failed to enhance tweets with Playright")
         return "Failed to enhance tweets with Playright"
     
     await report_progress(f"Processing {len(data['results'])} results")
@@ -375,52 +399,13 @@ async def enhance_tweets_playright(
     await report_progress("Completed enhancement")
     return "\n".join(results)
 
-@mcp.tool()
-async def automate_web_interaction(url: str, instructions: str) -> str:
-    """Automate web interactions using Playwright"""
-    
-    async def report_progress(message: str):
-        await send_progress(message)
-    
-    payload = {
-        "url": url,
-        "instructions": instructions
-    }
-    
-    await report_progress(f"Starting web automation for {url}")
-    
-    if instructions == "screenshot":
-        try:
-            await report_progress("Taking screenshot")
-            async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-                response = await client.post(
-                    f"{PLAYWRIGHT_MCP_URL}/automate",
-                    json=payload,
-                    headers={"Accept": "image/png"}
-                )
-                response.raise_for_status()
-                await report_progress("Screenshot taken")
-                return "Screenshot received (binary data)"
-        except Exception as e:
-            return f"Failed to get screenshot: {str(e)}"
-    else:
-        data = await make_api_request(
-            f"{PLAYWRIGHT_MCP_URL}/automate",
-            method="POST",
-            json_data=payload,
-            progress_callback=report_progress
-        )
-        
-        if not data:
-            return "Failed to perform web automation"
-        
-        await report_progress("Web automation completed")
-        return data.get("text", "No text content received")
-
 # Code Executor Endpoints
 @mcp.tool()
 async def execute_python_code(code: str) -> str:
     """Execute Python code in secure environment"""
+    async def report_progress(message: str):
+        await send_progress(message)
+        
     payload = {
         "code": code,
         "timeout": 10,
@@ -429,14 +414,20 @@ async def execute_python_code(code: str) -> str:
         "validate_code": True
     }
     
+    await report_progress("Preparing to execute Python code")
+    
     data = await make_api_request(
         f"{CODE_EXECUTOR_URL}/execute",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress("Failed to execute code")
         return "Failed to execute code"
+    
+    await report_progress("Code execution completed")
     
     return (
         f"Code Execution Results:\n"
@@ -498,6 +489,9 @@ async def store_engagement_data(
 ) -> str:
     """Store engagement data for a topic"""
     
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     metadata = {
         "source": source
     }
@@ -512,15 +506,20 @@ async def store_engagement_data(
         "metadata": metadata
     }
     
+    await report_progress(f"Storing engagement data for {topic} on {platform}")
+    
     data = await make_api_request(
         f"{PROPHET_SERVICE_URL}/api/v1/store-engagement",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress("Failed to store engagement data")
         return "Failed to store engagement data"
     
+    await report_progress("Engagement data stored successfully")
     return f"Status: {data.get('status', 'unknown')}\nMessage: {data.get('message', '')}"
 
 @mcp.tool()
@@ -529,6 +528,10 @@ async def store_platform_engagements(
     platform_engagements: List[dict]
 ) -> str:
     """Store engagement metrics from multiple platforms"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     payload = {
         "topic": topic,
         "timestamp": datetime.utcnow().isoformat(),
@@ -542,15 +545,21 @@ async def store_platform_engagements(
         }
     }
     
+    platforms = set(e.get("platform", "unknown") for e in platform_engagements)
+    await report_progress(f"Storing engagement data for {topic} on {', '.join(platforms)}")
+    
     data = await make_api_request(
         f"{PROPHET_SERVICE_URL}/api/v1/store-platform-engagements",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress("Failed to store platform engagements")
         return "Failed to store platform engagements"
     
+    await report_progress("Platform engagements stored successfully")
     return (
         f"Status: {data.get('status', 'unknown')}\n"
         f"Message: {data.get('message', '')}\n"
@@ -565,6 +574,10 @@ async def generate_engagement_forecast(
     include_history: bool = True
 ) -> str:
     """Generate engagement forecast for a topic"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     payload = {
         "topic": topic,
         "platform": platform,
@@ -573,14 +586,20 @@ async def generate_engagement_forecast(
         "include_history": include_history
     }
     
+    await report_progress(f"Generating forecast for {topic} on {platform} for {periods} days")
+    
     data = await make_api_request(
         f"{PROPHET_SERVICE_URL}/api/v1/forecast",
         method="POST",
-        json_data=payload
+        json_data=payload,
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress("Failed to generate forecast")
         return "Failed to generate forecast"
+    
+    await report_progress("Processing forecast data")
     
     forecast = "\n".join(
         f"{date}: {value}" 
@@ -592,6 +611,7 @@ async def generate_engagement_forecast(
         for date, value in zip(data.get("historical_dates", []), data.get("historical_values", []))
     )
     
+    await report_progress("Forecast generation completed")
     return (
         f"Forecast for {topic} on {platform}:\n{forecast}\n\n"
         f"Historical data:\n{history}"
@@ -600,17 +620,27 @@ async def generate_engagement_forecast(
 @mcp.tool()
 async def get_topic_history(topic: str, platform: Optional[str] = None) -> str:
     """Get historical engagement data for a topic"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
     params = {}
     if platform:
         params["platform"] = platform
     
+    await report_progress(f"Fetching history for {topic}" + (f" on {platform}" if platform else ""))
+    
     data = await make_api_request(
         f"{PROPHET_SERVICE_URL}/api/v1/topics/{topic}/history",
-        params=params
+        params=params,
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress(f"No historical data found for topic {topic}")
         return f"No historical data found for topic {topic}"
+    
+    await report_progress("Processing historical data")
     
     history = "\n".join(
         f"{item.get('timestamp', '')}: {item.get('value', 0)} "
@@ -618,6 +648,7 @@ async def get_topic_history(topic: str, platform: Optional[str] = None) -> str:
         for item in data.get("data", [])
     )
     
+    await report_progress("History retrieval completed")
     return (
         f"History for {topic} ({data.get('platform', 'all platforms')}):\n"
         f"{history}"
@@ -625,28 +656,42 @@ async def get_topic_history(topic: str, platform: Optional[str] = None) -> str:
 
 # Original Weather Tools (kept for compatibility)
 @mcp.tool()
-async def get_weather_alerts(state: str) -> str:
-    """Get weather alerts for a US state"""
-    url = f"{NWS_API_BASE}/alerts/active/area/{state}"
-    data = await make_api_request(url)
+async def get_weather_alerts(area: str) -> str:
+    """Get weather alerts for a location"""
     
-    if not data or "features" not in data:
+    async def report_progress(message: str):
+        await send_progress(message)
+    
+    await report_progress(f"Fetching weather alerts for {area}")
+    
+    data = await weather_api_request("forecast.json", {"q": area, "days": 1, "alerts": "yes"})
+    
+    if not data or "alerts" not in data:
+        await report_progress("Unable to fetch alerts")
         return "Unable to fetch alerts or no alerts found."
     
-    if not data["features"]:
-        return "No active alerts for this state."
+    alerts_data = data.get("alerts", {}).get("alert", [])
+    
+    if not alerts_data:
+        await report_progress("No active alerts for this area")
+        return "No active alerts for this area."
+    
+    await report_progress(f"Processing {len(alerts_data)} alerts")
     
     alerts = []
-    for feature in data["features"]:
-        props = feature.get("properties", {})
+    for alert in alerts_data:
         alerts.append(
-            f"Event: {props.get('event', 'Unknown')}\n"
-            f"Area: {props.get('areaDesc', 'Unknown')}\n"
-            f"Severity: {props.get('severity', 'Unknown')}\n"
-            f"Description: {props.get('description', 'No description')}\n"
+            f"Event: {alert.get('event', 'Unknown')}\n"
+            f"Severity: {alert.get('severity', 'Unknown')}\n"
+            f"Areas: {alert.get('areas', 'Unknown')}\n"
+            f"Category: {alert.get('category', 'Unknown')}\n"
+            f"Effective: {alert.get('effective', 'Unknown')}\n"
+            f"Expires: {alert.get('expires', 'Unknown')}\n"
+            f"Description: {alert.get('desc', 'No description')}\n"
             "---"
         )
     
+    await report_progress("Alerts processing completed")
     return "\n".join(alerts)
 
 @mcp.resource("echo://{message}")
@@ -657,34 +702,55 @@ def echo_resource(message: str) -> str:
 @mcp.tool()
 async def get_topic_latest(topic: str) -> str:
     """Get latest information for a topic"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
+    await report_progress(f"Fetching latest information for {topic}")
+    
     data = await make_api_request(
-        f"{PLAYWRIGHT_MCP_URL}/api/topic/{topic}/latest"
+        f"{PLAYWRIGHT_MCP_URL}/api/topic/{topic}/latest",
+        progress_callback=report_progress
     )
     
     if not data:
+        await report_progress(f"No latest data found for topic {topic}")
         return f"No latest data found for topic {topic}"
+    
+    await report_progress("Processing latest topic data")
     
     # Format the response based on what the API returns
     if isinstance(data, dict):
-        return f"Latest information for {topic}:\n{json.dumps(data, indent=2)}"
+        result = f"Latest information for {topic}:\n{json.dumps(data, indent=2)}"
     else:
-        return f"Latest information for {topic}:\n{data}"
+        result = f"Latest information for {topic}:\n{data}"
+    
+    await report_progress("Latest information retrieved")
+    return result
 
 @mcp.tool()
 async def debug_last_request() -> str:
     """Debug the last API request that failed"""
-    return f"""
+    
+    async def report_progress(message: str):
+        await send_progress(message)
+    
+    await report_progress("Generating debug information for last request")
+    
+    debug_info = f"""
 To debug API requests that are timing out (MCP error -32001):
 
 1. Check API endpoint is correct:
    - enhace-tweets-playwright → {PLAYWRIGHT_MCP_URL}/enhance-tweets-playwright
    - masa enhance → {MCP2_BASE_URL}/api/masa/enhance
    - store engagement → {PROPHET_SERVICE_URL}/api/v1/store-engagement
+   - weather API → {WEATHER_API_BASE} (with key {WEATHER_API_KEY})
 
 2. Verify request payload format:
    - For enhance-tweets-playwright: Use "tweets" list with tweet objects
    - For masa enhance: Use "query", "max_results", "enhance_top_x"
    - For playright enhance: Use "query", "max_results", "enhance_top_x" 
+   - For weather API: Make sure to include "key" parameter
 
 3. Current timeout setting is {API_TIMEOUT} seconds
    - These APIs may need more time to process, consider increasing timeout
@@ -699,7 +765,198 @@ To debug API requests that are timing out (MCP error -32001):
    - Playwright: Run check_playwright_health()
    - Prophet Service: Run check_prophet_health()
 """
+    
+    await report_progress("Debug information generated")
+    return debug_info
+
+# WeatherAPI.com Integration
+@mcp.tool()
+async def get_current_weather(q: str) -> str:
+    """
+    Get current weather for a location.
+    
+    Parameters:
+    - q: Location query (city name, lat/lon, IP address, US zip, UK postcode, etc.)
+    """
+    await send_progress(f"Fetching current weather for {q}")
+    data = await weather_api_request("current.json", {"q": q})
+    
+    if not data:
+        await send_progress(f"Failed to get current weather for {q}")
+        return f"Failed to get current weather for {q}"
+    
+    await send_progress("Formatting weather data")
+    
+    location = data.get("location", {})
+    current = data.get("current", {})
+    condition = current.get("condition", {})
+    
+    result = f"""Current Weather for {location.get('name', '')}, {location.get('region', '')}, {location.get('country', '')}:
+Local Time: {location.get('localtime', '')}
+Temperature: {current.get('temp_c', '')}°C / {current.get('temp_f', '')}°F
+Condition: {condition.get('text', '')}
+Feels Like: {current.get('feelslike_c', '')}°C / {current.get('feelslike_f', '')}°F
+Wind: {current.get('wind_kph', '')} kph / {current.get('wind_mph', '')} mph, direction {current.get('wind_dir', '')}
+Humidity: {current.get('humidity', '')}%
+Cloud Cover: {current.get('cloud', '')}%
+Precipitation: {current.get('precip_mm', '')} mm / {current.get('precip_in', '')} in
+UV Index: {current.get('uv', '')}
+"""
+    
+    await send_progress("Completed")
+    return result
+
+@mcp.tool()
+async def get_weather_forecast(q: str, days: int = 3) -> str:
+    """
+    Get weather forecast for a location.
+    
+    Parameters:
+    - q: Location query (city name, lat/lon, IP address, US zip, UK postcode, etc.)
+    - days: Number of days for forecast (1-14)
+    """
+    if days < 1 or days > 14:
+        await send_progress("Invalid days parameter")
+        return "Days parameter must be between 1 and 14"
+    
+    await send_progress(f"Fetching {days}-day forecast for {q}")
+    data = await weather_api_request("forecast.json", {"q": q, "days": days, "aqi": "yes", "alerts": "yes"})
+    
+    if not data:
+        await send_progress(f"Failed to get weather forecast for {q}")
+        return f"Failed to get weather forecast for {q}"
+    
+    await send_progress("Processing forecast data")
+    
+    location = data.get("location", {})
+    current = data.get("current", {})
+    forecast = data.get("forecast", {})
+    alerts = data.get("alerts", {})
+    
+    # Format current weather
+    await send_progress("Formatting current weather")
+    current_condition = current.get("condition", {})
+    current_weather = f"""Current Weather for {location.get('name', '')}, {location.get('region', '')}, {location.get('country', '')}:
+Local Time: {location.get('localtime', '')}
+Temperature: {current.get('temp_c', '')}°C / {current.get('temp_f', '')}°F
+Condition: {current_condition.get('text', '')}
+Feels Like: {current.get('feelslike_c', '')}°C / {current.get('feelslike_f', '')}°F
+Wind: {current.get('wind_kph', '')} kph / {current.get('wind_mph', '')} mph, direction {current.get('wind_dir', '')}
+Humidity: {current.get('humidity', '')}%
+"""
+    
+    # Format forecast days
+    await send_progress("Formatting forecast days")
+    forecast_days = []
+    for day in forecast.get("forecastday", []):
+        day_date = day.get("date", "")
+        day_data = day.get("day", {})
+        day_condition = day_data.get("condition", {})
+        
+        forecast_days.append(f"""Date: {day_date}
+Min/Max Temp: {day_data.get('mintemp_c', '')}°C to {day_data.get('maxtemp_c', '')}°C / {day_data.get('mintemp_f', '')}°F to {day_data.get('maxtemp_f', '')}°F
+Condition: {day_condition.get('text', '')}
+Chance of Rain: {day_data.get('daily_chance_of_rain', '')}%
+Max Wind: {day_data.get('maxwind_kph', '')} kph / {day_data.get('maxwind_mph', '')} mph
+Avg Humidity: {day_data.get('avghumidity', '')}%
+UV Index: {day_data.get('uv', '')}
+""")
+    
+    # Format alerts if any
+    await send_progress("Checking for weather alerts")
+    alert_text = ""
+    alert_list = alerts.get("alert", [])
+    if alert_list:
+        alert_items = []
+        for alert in alert_list:
+            alert_items.append(f"""Alert: {alert.get('headline', '')}
+Category: {alert.get('category', '')}
+Severity: {alert.get('severity', '')}
+Urgency: {alert.get('urgency', '')}
+Areas: {alert.get('areas', '')}
+Effective: {alert.get('effective', '')}
+Expires: {alert.get('expires', '')}
+Description: {alert.get('desc', '')}
+""")
+        alert_text = "Weather Alerts:\n" + "\n".join(alert_items)
+    
+    await send_progress("Forecast data ready")
+    return current_weather + "\n\nForecast:\n" + "\n".join(forecast_days) + "\n\n" + alert_text
+
+@mcp.tool()
+async def search_locations(q: str) -> str:
+    """
+    Search for locations using Weather API.
+    
+    Parameters:
+    - q: Location search query (city or partial name)
+    """
+    await send_progress(f"Searching for locations matching '{q}'")
+    data = await weather_api_request("search.json", {"q": q})
+    
+    if not data:
+        await send_progress(f"No locations found for '{q}'")
+        return f"No locations found for '{q}'"
+    
+    if not isinstance(data, list):
+        await send_progress(f"Invalid response format: {data}")
+        return f"Invalid response format for location search: {data}"
+    
+    if not data:
+        await send_progress(f"No locations found matching '{q}'")
+        return f"No locations found matching '{q}'"
+    
+    await send_progress(f"Found {len(data)} locations, formatting results")
+    
+    locations = []
+    for location in data:
+        locations.append(f"""{location.get('name', '')}, {location.get('region', '')}, {location.get('country', '')}
+Coordinates: {location.get('lat', '')}, {location.get('lon', '')}
+ID: {location.get('id', '')}
+""")
+    
+    await send_progress("Search completed")
+    return f"Found {len(locations)} locations matching '{q}':\n\n" + "\n".join(locations)
+
+@mcp.tool()
+async def get_time_zone(q: str) -> str:
+    """
+    Get timezone information for a location.
+    
+    Parameters:
+    - q: Location query (city name, lat/lon, IP address, US zip, UK postcode, etc.)
+    """
+    await send_progress(f"Fetching timezone data for {q}")
+    data = await weather_api_request("timezone.json", {"q": q})
+    
+    if not data:
+        await send_progress(f"Failed to get timezone information for {q}")
+        return f"Failed to get timezone information for {q}"
+    
+    await send_progress("Formatting timezone data")
+    
+    location = data.get("location", {})
+    
+    result = f"""Timezone Information for {location.get('name', '')}, {location.get('region', '')}, {location.get('country', '')}:
+Timezone: {location.get('tz_id', '')}
+Local Time: {location.get('localtime', '')}
+Latitude: {location.get('lat', '')}
+Longitude: {location.get('lon', '')}
+"""
+    
+    await send_progress("Timezone data ready")
+    return result
 
 if __name__ == "__main__":
     print("Starting MCP Integration Server with stdio transport...")
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    except Exception as e:
+        print(f"Error with stdio transport: {e}")
+        print("Trying HTTP transport...")
+        try:
+            mcp.run(transport="http", port=8000)
+        except Exception as e2:
+            print(f"Error with HTTP transport: {e2}")
+            print("Trying WebSocket transport...")
+            mcp.run(transport="ws", port=8001)
