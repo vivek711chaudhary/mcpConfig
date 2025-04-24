@@ -57,6 +57,9 @@ The server implements the following features and tools:
 - `get_topic_history(topic, platform)`: Get historical engagement data for a topic
 - `get_topic_latest(topic)`: Get latest information for a topic
 
+### Endpoints
+- `https://playwright-mcp-620401541065.us-central1.run.app/api/topic/:topic/latest`: Get latest information for any topic (This endpoint was  forgotten to be added to the in the mcp tools. It is working fine)
+
 ### System Health Checks
 - `check_mcp2_health()`: Check health status of MCP-2 Server
 - `check_playwright_health()`: Check health status of Playwright MCP
